@@ -9,7 +9,6 @@
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) ||     \
     defined(__OpenBSD__)
 #include <sys/event.h>
-#else
 #endif
 
 #include <array>
@@ -31,6 +30,9 @@ namespace {
 constexpr std::uint16_t default_port = 8080;
 constexpr std::size_t max_events = 256;
 constexpr std::size_t read_buffer_size = 64 * 1024;
+
+#if defined(TCP_SERVER_ENABLE_IO_URING)
+#endif
 
 class unique_fd {
 public:
@@ -69,11 +71,34 @@ private:
   int fd_ = -1;
 };
 
+enum class RequestedBackend {
+  auto_select,
+  poll,
+  io_uring,
+};
+
+struct ProgramOptions {
+  std::uint16_t port = default_port;
+  RequestedBackend backend = RequestedBackend::auto_select;
+};
+
 [[noreturn]] void throw_system_error(std::string_view operation,
                                      int error = errno) {
   throw std::system_error(error, std::generic_category(),
                           std::string(operation));
 }
+
+#if defined(__linux__) || defined(TCP_SERVER_ENABLE_IO_URING)
+[[nodiscard]] std::string errno_message(int error) {
+  return std::generic_category().message(error);
+}
+#endif
+
+#if defined(TCP_SERVER_ENABLE_IO_URING)
+[[nodiscard]] std::string negative_result_message(int result) {
+  return errno_message(-result);
+}
+#endif
 
 void set_close_on_exec(int fd) {
   const int flags = ::fcntl(fd, F_GETFD, 0);
@@ -110,6 +135,12 @@ void configure_client_socket(int fd) {
   set_socket_option(fd, SOL_SOCKET, SO_NOSIGPIPE, 1);
 #endif
 }
+
+#if defined(__linux__)
+[[nodiscard]] int accepted_socket_flags() noexcept {
+  return SOCK_NONBLOCK | SOCK_CLOEXEC;
+}
+#endif
 
 [[nodiscard]] unique_fd create_listening_socket(std::uint16_t port) {
   unique_fd server(::socket(AF_INET, SOCK_STREAM, 0));
@@ -166,7 +197,7 @@ struct accepted_client {
 #if defined(__linux__)
     const int client_fd =
         ::accept4(listener_fd, reinterpret_cast<sockaddr *>(&peer_address),
-                  &peer_address_size, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                  &peer_address_size, accepted_socket_flags());
 #else
     const int client_fd =
         ::accept(listener_fd, reinterpret_cast<sockaddr *>(&peer_address),
@@ -191,6 +222,75 @@ struct accepted_client {
 
     throw_system_error("accept");
   }
+}
+
+[[nodiscard]] std::uint16_t parse_port_value(std::string_view value) {
+  std::uint16_t port = 0;
+  const auto [ptr, error] =
+      std::from_chars(value.data(), value.data() + value.size(), port);
+  if (error != std::errc{} || ptr != value.data() + value.size() || port == 0) {
+    throw std::runtime_error("port must be an integer between 1 and 65535");
+  }
+
+  return port;
+}
+
+[[nodiscard]] RequestedBackend parse_backend_value(std::string_view value) {
+  if (value == "auto") {
+    return RequestedBackend::auto_select;
+  }
+  if (value == "poll") {
+    return RequestedBackend::poll;
+  }
+  if (value == "io_uring") {
+    return RequestedBackend::io_uring;
+  }
+
+  throw std::runtime_error("backend must be auto, poll, or io_uring");
+}
+
+[[nodiscard]] ProgramOptions parse_options(int argc, char *argv[]) {
+  ProgramOptions options{};
+  bool saw_port = false;
+
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view argument{argv[index]};
+
+    if (argument == "--help") {
+      throw std::runtime_error(
+          "usage: ./tcp_server [port] [--backend auto|poll|io_uring]");
+    }
+
+    if (argument == "--backend") {
+      ++index;
+      if (index >= argc) {
+        throw std::runtime_error("missing value after --backend");
+      }
+      options.backend = parse_backend_value(argv[index]);
+      continue;
+    }
+
+    constexpr std::string_view backend_prefix = "--backend=";
+    if (argument.starts_with(backend_prefix)) {
+      options.backend =
+          parse_backend_value(argument.substr(backend_prefix.size()));
+      continue;
+    }
+
+    if (argument.starts_with("--")) {
+      throw std::runtime_error("unknown option: " + std::string(argument));
+    }
+
+    if (saw_port) {
+      throw std::runtime_error(
+          "usage: ./tcp_server [port] [--backend auto|poll|io_uring]");
+    }
+
+    options.port = parse_port_value(argument);
+    saw_port = true;
+  }
+
+  return options;
 }
 
 struct ReadyEvent {
@@ -255,7 +355,7 @@ public:
       const int error = errno;
       if (error != ENOENT && error != EBADF) {
         std::cerr << "epoll_ctl(DEL) failed for fd " << fd << ": "
-                  << std::generic_category().message(error) << '\n';
+                  << errno_message(error) << '\n';
       }
     }
 #else
@@ -344,8 +444,8 @@ private:
   unique_fd handle_;
 };
 
-struct Connection {
-  Connection(unique_fd socket_fd, std::string peer_name) noexcept
+struct PollConnection {
+  PollConnection(unique_fd socket_fd, std::string peer_name) noexcept
       : socket(std::move(socket_fd)), peer(std::move(peer_name)) {}
 
   [[nodiscard]] int fd() const noexcept { return socket.get(); }
@@ -358,9 +458,10 @@ struct Connection {
   std::string peer;
   std::string pending_output;
   std::size_t write_offset = 0;
+  bool read_closed = false;
 };
 
-using ConnectionMap = std::unordered_map<int, Connection>;
+using PollConnectionMap = std::unordered_map<int, PollConnection>;
 
 [[nodiscard]] constexpr int send_flags() noexcept {
 #ifdef MSG_NOSIGNAL
@@ -370,7 +471,7 @@ using ConnectionMap = std::unordered_map<int, Connection>;
 #endif
 }
 
-void register_client(Poller &poller, ConnectionMap &connections,
+void register_client(Poller &poller, PollConnectionMap &connections,
                      accepted_client client) {
   const int fd = client.socket.get();
   poller.add(fd);
@@ -387,7 +488,7 @@ void register_client(Poller &poller, ConnectionMap &connections,
   }
 }
 
-void close_connection(Poller &poller, ConnectionMap &connections, int fd,
+void close_connection(Poller &poller, PollConnectionMap &connections, int fd,
                       std::string_view reason) noexcept {
   const auto connection_it = connections.find(fd);
   if (connection_it == connections.end()) {
@@ -400,7 +501,7 @@ void close_connection(Poller &poller, ConnectionMap &connections, int fd,
   connections.erase(connection_it);
 }
 
-void accept_pending_clients(Poller &poller, ConnectionMap &connections,
+void accept_pending_clients(Poller &poller, PollConnectionMap &connections,
                             int listener_fd) {
   while (true) {
     accepted_client client = accept_client(listener_fd);
@@ -414,7 +515,13 @@ void accept_pending_clients(Poller &poller, ConnectionMap &connections,
   }
 }
 
-[[nodiscard]] bool read_into_output(Connection &connection) {
+enum class ReadResult {
+  open,
+  remote_closed,
+  error,
+};
+
+[[nodiscard]] ReadResult read_into_output(PollConnection &connection) {
   std::array<char, read_buffer_size> buffer{};
 
   while (true) {
@@ -428,7 +535,7 @@ void accept_pending_clients(Poller &poller, ConnectionMap &connections,
     }
 
     if (bytes_read == 0) {
-      return false;
+      return ReadResult::remote_closed;
     }
 
     if (errno == EINTR) {
@@ -436,14 +543,14 @@ void accept_pending_clients(Poller &poller, ConnectionMap &connections,
     }
 
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return true;
+      return ReadResult::open;
     }
 
-    return false;
+    return ReadResult::error;
   }
 }
 
-[[nodiscard]] bool flush_output(Connection &connection) {
+[[nodiscard]] bool flush_output(PollConnection &connection) {
   while (connection.wants_write()) {
     const char *data =
         connection.pending_output.data() + connection.write_offset;
@@ -480,86 +587,470 @@ void accept_pending_clients(Poller &poller, ConnectionMap &connections,
   return true;
 }
 
-[[nodiscard]] std::uint16_t parse_port(int argc, char *argv[]) {
-  if (argc == 1) {
-    return default_port;
+void run_poll_server(std::uint16_t port) {
+  unique_fd listener = create_listening_socket(port);
+
+  Poller poller;
+  poller.add(listener.get());
+
+  PollConnectionMap connections;
+  connections.reserve(1024);
+
+  std::array<Poller::native_event, max_events> events{};
+
+  std::cout << "listening on 0.0.0.0:" << port << " backend=poll\n";
+
+  while (true) {
+    const int ready = poller.wait(events, -1);
+
+    for (int index = 0; index < ready; ++index) {
+      const ReadyEvent event =
+          Poller::translate(events[static_cast<std::size_t>(index)]);
+
+      if (event.fd == listener.get()) {
+        accept_pending_clients(poller, connections, listener.get());
+        continue;
+      }
+
+      auto connection_it = connections.find(event.fd);
+      if (connection_it == connections.end()) {
+        continue;
+      }
+
+      PollConnection &connection = connection_it->second;
+      bool keep_open = true;
+
+      if (event.readable) {
+        switch (read_into_output(connection)) {
+        case ReadResult::open:
+          break;
+        case ReadResult::remote_closed:
+          connection.read_closed = true;
+          break;
+        case ReadResult::error:
+          keep_open = false;
+          break;
+        }
+      }
+
+      if (keep_open && (event.writable || connection.wants_write())) {
+        keep_open = flush_output(connection);
+      }
+
+      if (event.remote_closed) {
+        connection.read_closed = true;
+      }
+
+      if (connection.read_closed && !connection.wants_write()) {
+        close_connection(poller, connections, event.fd, "remote-closed");
+        continue;
+      }
+
+      if (!keep_open || event.error) {
+        close_connection(poller, connections, event.fd,
+                         event.error ? "poll-error" : "socket-closed");
+        continue;
+      }
+
+      poller.set_write_interest(event.fd, connection.wants_write());
+    }
+  }
+}
+
+#if defined(TCP_SERVER_ENABLE_IO_URING)
+
+struct UringConnection {
+  UringConnection(unique_fd socket_fd, std::string peer_name) noexcept
+      : socket(std::move(socket_fd)), peer(std::move(peer_name)) {}
+
+  [[nodiscard]] int fd() const noexcept { return socket.get(); }
+
+  unique_fd socket;
+  std::string peer;
+  std::array<char, read_buffer_size> read_buffer{};
+  std::deque<std::string> pending_chunks;
+  std::size_t front_offset = 0;
+  bool recv_pending = false;
+  bool send_pending = false;
+  bool closing = false;
+  bool read_closed = false;
+};
+
+enum class UringOp {
+  accept,
+  recv,
+  send,
+};
+
+struct UringRequest {
+  explicit UringRequest(UringOp operation) noexcept : op(operation) {}
+
+  UringOp op;
+  std::shared_ptr<UringConnection> connection;
+  sockaddr_in peer_address{};
+  socklen_t peer_address_size = sizeof(peer_address);
+};
+
+class IoUringServer {
+public:
+  explicit IoUringServer(std::uint16_t port)
+      : listener_(create_listening_socket(port)) {
+    io_uring_params params{};
+    params.flags = 0;
+    params.cq_entries = io_uring_cq_entries;
+
+    const int result =
+        ::io_uring_queue_init_params(io_uring_entries, &ring_, &params);
+    if (result < 0) {
+      throw std::runtime_error("io_uring_queue_init_params: " +
+                               negative_result_message(result));
+    }
   }
 
-  if (argc != 2) {
-    throw std::runtime_error("usage: ./tcp_server [port]");
+  ~IoUringServer() { ::io_uring_queue_exit(&ring_); }
+
+  IoUringServer(const IoUringServer &) = delete;
+  IoUringServer &operator=(const IoUringServer &) = delete;
+
+  void run() {
+    std::cout << "listening on 0.0.0.0:" << port() << " backend=io_uring\n";
+    queue_accept();
+
+    while (true) {
+      io_uring_cqe *cqe = nullptr;
+      const int wait_result = ::io_uring_wait_cqe(&ring_, &cqe);
+      if (wait_result < 0) {
+        throw std::runtime_error("io_uring_wait_cqe: " +
+                                 negative_result_message(wait_result));
+      }
+
+      while (cqe != nullptr) {
+        handle_completion(cqe);
+        ::io_uring_cqe_seen(&ring_, cqe);
+
+        cqe = nullptr;
+        if (::io_uring_peek_cqe(&ring_, &cqe) != 0) {
+          break;
+        }
+      }
+    }
   }
 
-  std::uint16_t port = 0;
-  const std::string_view value{argv[1]};
-  const auto [ptr, error] =
-      std::from_chars(value.data(), value.data() + value.size(), port);
-  if (error != std::errc{} || ptr != value.data() + value.size() || port == 0) {
-    throw std::runtime_error("port must be an integer between 1 and 65535");
+private:
+  using RequestMap =
+      std::unordered_map<UringRequest *, std::unique_ptr<UringRequest>>;
+  using ConnectionMap =
+      std::unordered_map<int, std::shared_ptr<UringConnection>>;
+
+  [[nodiscard]] std::uint16_t port() const noexcept {
+    sockaddr_in address{};
+    socklen_t size = sizeof(address);
+    if (::getsockname(listener_.get(), reinterpret_cast<sockaddr *>(&address),
+                      &size) == -1) {
+      return 0;
+    }
+    return ntohs(address.sin_port);
   }
 
-  return port;
+  [[nodiscard]] io_uring_sqe *acquire_sqe() {
+    io_uring_sqe *sqe = ::io_uring_get_sqe(&ring_);
+    if (sqe != nullptr) {
+      return sqe;
+    }
+
+    const int submit_result = ::io_uring_submit(&ring_);
+    if (submit_result < 0) {
+      throw std::runtime_error("io_uring_submit: " +
+                               negative_result_message(submit_result));
+    }
+
+    sqe = ::io_uring_get_sqe(&ring_);
+    if (sqe == nullptr) {
+      throw std::runtime_error("io_uring SQ ring exhausted");
+    }
+    return sqe;
+  }
+
+  void submit_request(UringRequest *request,
+                      std::unique_ptr<UringRequest> owned) {
+    pending_requests_.emplace(request, std::move(owned));
+
+    const int submit_result = ::io_uring_submit(&ring_);
+    if (submit_result < 0) {
+      pending_requests_.erase(request);
+      throw std::runtime_error("io_uring_submit: " +
+                               negative_result_message(submit_result));
+    }
+  }
+
+  void queue_accept() {
+    auto request = std::make_unique<UringRequest>(UringOp::accept);
+    UringRequest *raw_request = request.get();
+
+    io_uring_sqe *sqe = acquire_sqe();
+    ::io_uring_prep_accept(
+        sqe, listener_.get(),
+        reinterpret_cast<sockaddr *>(&raw_request->peer_address),
+        &raw_request->peer_address_size, accepted_socket_flags());
+    ::io_uring_sqe_set_data(sqe, raw_request);
+
+    submit_request(raw_request, std::move(request));
+  }
+
+  void queue_recv(const std::shared_ptr<UringConnection> &connection) {
+    if (connection->closing || connection->recv_pending) {
+      return;
+    }
+
+    auto request = std::make_unique<UringRequest>(UringOp::recv);
+    request->connection = connection;
+    UringRequest *raw_request = request.get();
+
+    io_uring_sqe *sqe = acquire_sqe();
+    ::io_uring_prep_recv(sqe, connection->fd(), connection->read_buffer.data(),
+                         connection->read_buffer.size(), 0);
+#ifdef IORING_RECVSEND_POLL_FIRST
+    sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+#endif
+    ::io_uring_sqe_set_data(sqe, raw_request);
+
+    connection->recv_pending = true;
+    submit_request(raw_request, std::move(request));
+  }
+
+  void queue_send(const std::shared_ptr<UringConnection> &connection) {
+    if (connection->closing || connection->send_pending ||
+        connection->pending_chunks.empty()) {
+      return;
+    }
+
+    auto request = std::make_unique<UringRequest>(UringOp::send);
+    request->connection = connection;
+    UringRequest *raw_request = request.get();
+
+    const std::string &chunk = connection->pending_chunks.front();
+    const char *data = chunk.data() + connection->front_offset;
+    const std::size_t bytes_left = chunk.size() - connection->front_offset;
+
+    io_uring_sqe *sqe = acquire_sqe();
+    ::io_uring_prep_send(sqe, connection->fd(), data, bytes_left, send_flags());
+#ifdef IORING_RECVSEND_POLL_FIRST
+    sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+#endif
+    ::io_uring_sqe_set_data(sqe, raw_request);
+
+    connection->send_pending = true;
+    submit_request(raw_request, std::move(request));
+  }
+
+  void close_connection(const std::shared_ptr<UringConnection> &connection,
+                        std::string_view reason) {
+    if (connection->closing) {
+      return;
+    }
+
+    connection->closing = true;
+    connections_.erase(connection->fd());
+    std::cout << "closed connection from " << connection->peer
+              << " fd=" << connection->fd() << " reason=" << reason << '\n';
+  }
+
+  void
+  maybe_finish_connection(const std::shared_ptr<UringConnection> &connection) {
+    if (!connection->closing) {
+      return;
+    }
+    if (connection->recv_pending || connection->send_pending) {
+      return;
+    }
+
+    connection->socket.reset();
+    connection->pending_chunks.clear();
+    connection->front_offset = 0;
+  }
+
+  void consume_sent_bytes(UringConnection &connection, std::size_t bytes_sent) {
+    while (bytes_sent > 0 && !connection.pending_chunks.empty()) {
+      std::string &front = connection.pending_chunks.front();
+      const std::size_t available = front.size() - connection.front_offset;
+      if (bytes_sent < available) {
+        connection.front_offset += bytes_sent;
+        return;
+      }
+
+      bytes_sent -= available;
+      connection.pending_chunks.pop_front();
+      connection.front_offset = 0;
+    }
+  }
+
+  void handle_accept(UringRequest &request, int result) {
+    queue_accept();
+
+    if (result < 0) {
+      switch (-result) {
+      case EAGAIN:
+      case EWOULDBLOCK:
+      case EINTR:
+      case ECONNABORTED:
+      case EPROTO:
+        return;
+      default:
+        throw std::runtime_error("io_uring accept failed: " +
+                                 negative_result_message(result));
+      }
+    }
+
+    unique_fd client_fd(result);
+    configure_client_socket(client_fd.get());
+
+    auto connection = std::make_shared<UringConnection>(
+        std::move(client_fd), format_endpoint(request.peer_address));
+    const int fd = connection->fd();
+    const auto [_, inserted] = connections_.try_emplace(fd, connection);
+    if (!inserted) {
+      throw std::runtime_error("duplicate file descriptor");
+    }
+
+    std::cout << "accepted connection from " << connection->peer << " fd=" << fd
+              << '\n';
+    queue_recv(connection);
+  }
+
+  void handle_recv(UringRequest &request, int result) {
+    const std::shared_ptr<UringConnection> connection = request.connection;
+    connection->recv_pending = false;
+
+    if (connection->closing) {
+      maybe_finish_connection(connection);
+      return;
+    }
+
+    if (result == 0) {
+      connection->read_closed = true;
+      if (connection->pending_chunks.empty() && !connection->send_pending) {
+        close_connection(connection, "remote-closed");
+        maybe_finish_connection(connection);
+      }
+      return;
+    }
+
+    if (result < 0) {
+      close_connection(connection, "recv-error");
+      maybe_finish_connection(connection);
+      return;
+    }
+
+    connection->pending_chunks.emplace_back(connection->read_buffer.data(),
+                                            static_cast<std::size_t>(result));
+
+    if (!connection->read_closed) {
+      queue_recv(connection);
+    }
+    queue_send(connection);
+  }
+
+  void handle_send(UringRequest &request, int result) {
+    const std::shared_ptr<UringConnection> connection = request.connection;
+    connection->send_pending = false;
+
+    if (result <= 0) {
+      close_connection(connection, result == 0 ? "send-closed" : "send-error");
+      maybe_finish_connection(connection);
+      return;
+    }
+
+    consume_sent_bytes(*connection, static_cast<std::size_t>(result));
+
+    if (connection->closing) {
+      maybe_finish_connection(connection);
+      return;
+    }
+
+    if (connection->read_closed && connection->pending_chunks.empty()) {
+      close_connection(connection, "remote-closed");
+      maybe_finish_connection(connection);
+      return;
+    }
+
+    if (!connection->pending_chunks.empty()) {
+      queue_send(connection);
+    }
+  }
+
+  void handle_completion(io_uring_cqe *cqe) {
+    auto *request = static_cast<UringRequest *>(::io_uring_cqe_get_data(cqe));
+    const auto request_it = pending_requests_.find(request);
+    if (request_it == pending_requests_.end()) {
+      return;
+    }
+
+    std::unique_ptr<UringRequest> owned_request = std::move(request_it->second);
+    pending_requests_.erase(request_it);
+
+    switch (owned_request->op) {
+    case UringOp::accept:
+      handle_accept(*owned_request, cqe->res);
+      break;
+    case UringOp::recv:
+      handle_recv(*owned_request, cqe->res);
+      break;
+    case UringOp::send:
+      handle_send(*owned_request, cqe->res);
+      break;
+    }
+  }
+
+  io_uring ring_{};
+  unique_fd listener_;
+  RequestMap pending_requests_;
+  ConnectionMap connections_;
+};
+
+void run_io_uring_server(std::uint16_t port) {
+  IoUringServer server(port);
+  server.run();
+}
+
+#else
+
+[[noreturn]] void run_io_uring_server(std::uint16_t) {
+  throw std::runtime_error(
+      "io_uring backend was not built; use --backend poll or build on Linux "
+      "with liburing available");
+}
+
+#endif
+
+void run_server(const ProgramOptions &options) {
+  switch (options.backend) {
+  case RequestedBackend::poll:
+    run_poll_server(options.port);
+    return;
+  case RequestedBackend::io_uring:
+    run_io_uring_server(options.port);
+    return;
+  case RequestedBackend::auto_select:
+#if defined(TCP_SERVER_ENABLE_IO_URING)
+    try {
+      run_io_uring_server(options.port);
+      return;
+    } catch (const std::exception &error) {
+      std::cerr << "io_uring unavailable, falling back to poll: "
+                << error.what() << '\n';
+    }
+#endif
+    run_poll_server(options.port);
+    return;
+  }
 }
 
 } // namespace
 
 int main(int argc, char *argv[]) {
   try {
-    const std::uint16_t port = parse_port(argc, argv);
-    unique_fd listener = create_listening_socket(port);
-
-    Poller poller;
-    poller.add(listener.get());
-
-    ConnectionMap connections;
-    connections.reserve(1024);
-
-    std::array<Poller::native_event, max_events> events{};
-
-    std::cout << "listening on 0.0.0.0:" << port << '\n';
-
-    while (true) {
-      const int ready = poller.wait(events, -1);
-
-      for (int index = 0; index < ready; ++index) {
-        const ReadyEvent event =
-            Poller::translate(events[static_cast<std::size_t>(index)]);
-
-        if (event.fd == listener.get()) {
-          accept_pending_clients(poller, connections, listener.get());
-          continue;
-        }
-
-        auto connection_it = connections.find(event.fd);
-        if (connection_it == connections.end()) {
-          continue;
-        }
-
-        Connection &connection = connection_it->second;
-        bool keep_open = true;
-        bool handled_io = false;
-
-        if (event.readable) {
-          handled_io = true;
-          keep_open = read_into_output(connection);
-        }
-
-        if (keep_open && (event.writable || connection.wants_write())) {
-          handled_io = true;
-          keep_open = flush_output(connection);
-        }
-
-        if (!keep_open || event.error || (event.remote_closed && !handled_io)) {
-          close_connection(poller, connections, event.fd,
-                           event.error ? "poll-error"
-                                       : (event.remote_closed && !handled_io
-                                              ? "remote-closed"
-                                              : "socket-closed"));
-          continue;
-        }
-
-        poller.set_write_interest(event.fd, connection.wants_write());
-      }
-    }
+    const ProgramOptions options = parse_options(argc, argv);
+    run_server(options);
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return EXIT_FAILURE;
