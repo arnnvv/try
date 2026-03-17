@@ -1,3 +1,15 @@
 -std=c++23
 -Wall
 -Wextra
+-Wpedantic
+-Wconversion
+-Wsign-conversion
+-Wshadow
+-Wformat=2
+-Wnull-dereference
+-Wimplicit-fallthrough
+-Wextra-semi
+-Wnon-virtual-dtor
+-fno-rtti
+-O2
+-march=native
